@@ -26,6 +26,8 @@ GUI at all.
 - **Hub menu:** pick the hub when there's more than one. On Coolgear hubs also **save the
   current states as the power-on default** (stored in the hub) or **reset the hub**.
 - Re-reads the ports every 2 seconds, so changes made from the command line show up too.
+- With uhubctl, ports that feed another hub are locked, so one click can't cut a whole bank
+  of sockets (see [Use](#use)).
 
 <img src="docs/portrait.png" alt="Portrait: port 1 at the top" width="120">
 
@@ -79,6 +81,13 @@ meter before relying on it.
 usbhub-panel                     # Coolgear if cusbi finds a hub, otherwise uhubctl
 usbhub-panel --backend uhubctl   # force a backend
 ```
+
+**Big hubs are several hubs inside.** A 7- or 10-port hub is usually two or three 4-port hub
+chips chained together, and uhubctl lists each chip as its own hub. Some of a chip's ports are
+then links to the next chip, not sockets on the case; switching one off would cut every socket
+behind it. The panel spots ports with another hub plugged in, shows them as "hub link" and
+locks them (All off skips them too). Which socket on the case is which chip and port isn't
+something uhubctl can know; plug a device in and watch which button shows it.
 
 A USB 3 hub appears to uhubctl as two hubs (its USB 2 and USB 3 halves on different buses).
 The panel lists it once and uhubctl switches both halves together. On first run the panel picks
