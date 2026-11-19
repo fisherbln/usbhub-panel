@@ -80,7 +80,8 @@ On the Coolgear CG-10PU3MGD, uhubctl does cut power: it sees the hub as three VI
 (2109:2817 and 2109:0817), and switching off the four ports of chip `1-8.3` took sockets 3–6 to
 0 V on a USB meter. The panel still prefers the `coolgear` backend on Coolgear hubs (it picks it
 when `cusbi` finds one): `cusbi` numbers the ports as printed on the case and keeps the hub's
-port LEDs and saved power-on states in step, while uhubctl works chip by chip.
+port LEDs and saved power-on states in step, while uhubctl works chip by chip and leaves a
+switched-off socket's LED lit.
 
 ## Use
 
