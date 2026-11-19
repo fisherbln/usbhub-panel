@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""usbhub-panel: click USB hub ports on and off.
+
+A small Qt window for switching the power on individual USB hub ports.
+Two backends:
+
+  coolgear  Coolgear managed hubs (CG-10PU3MGD and siblings), through
+            Coolgear's `cusbi` utility (download it from coolgear.com).
+  uhubctl   Any hub that supports per-port power switching, through
+            uhubctl (https://github.com/mvp/uhubctl). Not every hub that
+            claims support really cuts the power: check with a USB meter.
+
+By default it uses a Coolgear hub if `cusbi` finds one, otherwise uhubctl.
+Force one with --backend coolgear|uhubctl.
+
+  Left-click a port      toggle its power
+  Right-click a port     power-cycle it, or rename it
+  All on / All off       switch every port at once
+  Rotate                 switch between a row (landscape) and a column (portrait)
+  Hub menu               pick the hub (when there's more than one); on Coolgear
+                         hubs also save the power-on default or reset the hub
+
+Settings (port names, layout, last hub) live in
+~/.config/usbhub-panel/usbhub-panel.conf. Set CUSBI or UHUBCTL to point at
+the tools if they aren't on your PATH.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+
+from PyQt6.QtCore import QSettings, QTimer, Qt
+from PyQt6.QtGui import QActionGroup
+from PyQt6.QtWidgets import (
+    QApplication,
+    QBoxLayout,
+    QInputDialog,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+POLL_MS = 2000          # how often to re-read port states
+CYCLE_OFF_MS = 1500     # how long a power-cycle holds the port off
+TIMEOUT_S = 10
+
+
+class BackendError(Exception):
+    pass
+
+
+def run(tool, *args):
+    """Run a command-line tool and return its stdout, stripped."""
+    try:
+        result = subprocess.run(
+            [tool, *args], capture_output=True, text=True, timeout=TIMEOUT_S
+        )
+    except FileNotFoundError:
+        raise BackendError(f"{os.path.basename(tool)} not found at {tool}")
+    except subprocess.TimeoutExpired:
+        raise BackendError(f"{os.path.basename(tool)} timed out")
+    out = (result.stdout or "").strip()
+    if result.returncode != 0:
+        msg = (result.stderr or out or f"exit code {result.returncode}").strip()
+        raise BackendError(msg.splitlines()[-1] if msg else msg)
+    return out
+
+
+@dataclass
+class Hub:
+    key: str        # stable name for settings (survives replugging)
+    address: str    # what the tool needs to reach it right now
+    nports: int
+    label: str      # shown in the Hub menu
+
+
+# --- Coolgear (cusbi) -------------------------------------------------------
+class CoolgearBackend:
+    name = "coolgear"
+    title = "Coolgear"
+    # Coolgear's 10-port hub has port 10 on the left and port 1 next to the
+    # upstream connector, so the panel lays the buttons out highest first.
+    descending = True
+    can_save_defaults = True
+    can_reset = True
+
+    def __init__(self):
+        self.tool = os.environ.get("CUSBI") or shutil.which("cusbi") or "/usr/local/bin/cusbi"
+
+    def available(self):
+        return os.path.exists(self.tool) or shutil.which(self.tool) is not None
+
+    def hubs(self):
+        # `cusbi /Q -F`: 4-digit count, then comma-separated control ports,
+        # e.g. "0001ttyUSB0".
+        out = run(self.tool, "/Q", "-F").splitlines()
+        line = out[-1].strip() if out else ""
+        if len(line) < 4 or not line[:4].isdigit() or int(line[:4]) == 0:
+            return []
+        hubs = []
+        ctrls = [p.strip() for p in line[4:].split(",") if p.strip()]
+        for i, ctrl in enumerate(ctrls):
+            # The serial port name can change (another USB-serial adapter can take
+            # ttyUSB0), so settings are keyed by the hub's position in the list.
+            hubs.append(Hub(f"{i}", ctrl, self._port_count(ctrl),
+                            f"Coolgear hub {i + 1} ({ctrl})"))
+        return hubs
+
+    def _port_count(self, ctrl):
+        # `cusbi /Q:<ctrl> -F`: 8 hex chars of state, 2-digit port count,
+        # 3-char firmware version, e.g. "FBFFFFFF0Av01".
+        try:
+            line = run(self.tool, f"/Q:{ctrl}", "-F").splitlines()[-1].strip()
+            return int(line[8:10], 16)
+        except (BackendError, ValueError, IndexError):
+            return 10
+
+    def states(self, hub):
+        # One 0/1 per port, rightmost = port 1.
+        out = run(self.tool, f"/G:{hub.address}", "-B").splitlines()
+        bits = "".join(c for c in (out[-1] if out else "") if c in "01")
+        if len(bits) < hub.nports:
+            raise BackendError(f"unexpected state string: {out!r}")
+        bits = bits[-hub.nports:]
+        return {p: bits[-p] == "1" for p in range(1, hub.nports + 1)}
+
+    def set_ports(self, hub, ports, on):
+        arg = "ALL" if len(ports) == hub.nports else ",".join(map(str, ports))
+        run(self.tool, f"/S:{hub.address}", f"{1 if on else 0}:{arg}")
+
+    def save_defaults(self, hub):
+        run(self.tool, f"/W:{hub.address}")
+
+    def reset(self, hub):
+        run(self.tool, f"/R:{hub.address}")
+
+
+# --- uhubctl --------------------------------------------------------------------
+HUB_LINE = re.compile(r"^(?:Current|New) status for hub (\S+) \[(.*)\]$")
+PORT_LINE = re.compile(r"^\s+Port (\d+): [0-9a-f]{4}(.*)$")
+
+
+def parse_uhubctl(text):
+    """{location: (description, {port: on})} from uhubctl's status output.
+    A later block for the same hub (after an action) replaces the earlier one."""
+    hubs, current = {}, None
+    for line in text.splitlines():
+        m = HUB_LINE.match(line)
+        if m:
+            current = m.group(1)
+            hubs[current] = (m.group(2), {})
+            continue
+        m = PORT_LINE.match(line)
+        if m and current:
+            words = m.group(2).split("[")[0].split()
+            hubs[current][1][int(m.group(1))] = "off" not in words
+    return hubs
+
+
+class UhubctlBackend:
+    name = "uhubctl"
+    title = "uhubctl"
+    descending = False
+    can_save_defaults = False
+    can_reset = False
+
+    def __init__(self):
+        self.tool = os.environ.get("UHUBCTL") or shutil.which("uhubctl") or "/usr/sbin/uhubctl"
+
+    def available(self):
+        return os.path.exists(self.tool) or shutil.which(self.tool) is not None
+
+    def hubs(self):
+        try:
+            text = run(self.tool)
+        except BackendError as e:
+            raise BackendError(f"{e} (uhubctl may need root or a udev rule: see its README)")
+        found = parse_uhubctl(text)
+        # A USB 3 hub shows up twice: its USB 2 half on one bus and its USB 3 half on
+        # another (e.g. 1-8 and 2-8). uhubctl switches both when given either, so list
+        # each physical hub once, under its USB 2 half where there is one.
+        hubs, seen = [], {}
+        for loc, (desc, ports) in found.items():
+            nports = len(ports)
+            m = re.search(r"(\d+) ports", desc)
+            if m:
+                nports = int(m.group(1))
+            path = loc.split("-", 1)[1] if "-" in loc else ""
+            usb3 = "USB 3" in desc
+            twin = (path, nports) if path else None
+            if twin and twin in seen:
+                i = seen[twin]
+                if hubs[i][1] and not usb3:   # prefer the USB 2 half
+                    hubs[i] = (Hub(loc, loc, nports, f"{loc}: {desc}"), usb3)
+                continue
+            if twin:
+                seen[twin] = len(hubs)
+            hubs.append((Hub(loc, loc, nports, f"{loc}: {desc}"), usb3))
+        return [h for h, _ in hubs]
+
+    def states(self, hub):
+        found = parse_uhubctl(run(self.tool, "-l", hub.address))
+        if hub.address not in found:
+            raise BackendError(f"hub {hub.address} not found")
+        states = found[hub.address][1]
+        return {p: states.get(p, False) for p in range(1, hub.nports + 1)}
+
+    def set_ports(self, hub, ports, on):
+        run(self.tool, "-l", hub.address, "-p", ",".join(map(str, ports)),
+            "-a", "1" if on else "0")
+
+
+BACKENDS = {"coolgear": CoolgearBackend, "uhubctl": UhubctlBackend}
+
+
+def pick_backend(choice):
+    if choice != "auto":
+        return BACKENDS[choice]()
+    coolgear = CoolgearBackend()
+    if coolgear.available():
+        try:
+            if coolgear.hubs():
+                return coolgear
+        except BackendError:
+            pass
+    uhubctl = UhubctlBackend()
+    if uhubctl.available():
+        return uhubctl
+    return coolgear if coolgear.available() else uhubctl
+
+
+# --- UI -------------------------------------------------------------------------
+class PortButton(QPushButton):
+    def __init__(self, panel, port):
+        super().__init__()
+        self.panel = panel
+        self.port = port
+        self.setCheckable(True)
+        # Same size in a row or a column: wide enough for ~8 characters, tall enough for
+        # the three lines (port, name, state). Longer names are shortened with "…".
+        fm = self.fontMetrics()
+        self.name_width = fm.horizontalAdvance("M" * 8)
+        self.setFixedSize(self.name_width + 20, fm.lineSpacing() * 3 + 20)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_menu)
+        self.clicked.connect(lambda checked: panel.set_port(port, checked))
+
+    def show_menu(self, pos):
+        menu = QMenu(self)
+        menu.addAction("Power-cycle", lambda: self.panel.cycle_port(self.port))
+        menu.addAction("Rename…", lambda: self.panel.rename_port(self.port))
+        menu.exec(self.mapToGlobal(pos))
+
+    def update_view(self, on, name):
+        self.setChecked(on)
+        label = f"{self.port}"
+        if name:
+            short = self.fontMetrics().elidedText(
+                name, Qt.TextElideMode.ElideRight, self.name_width
+            )
+            label += f"\n{short}"
+        label += f"\n{'ON' if on else 'off'}"
+        self.setText(label)
+        self.setToolTip(
+            f"Port {self.port}" + (f" — {name}" if name else "")
+            + "\nClick to toggle, right-click for more"
+        )
+        # Colour the state so it reads at a glance; the palette keeps it
+        # matching the desktop theme otherwise.
+        self.setStyleSheet(
+            "QPushButton:checked { background-color: #2e7d32; color: white; }"
+            if on else ""
+        )
+
+
+class Panel(QWidget):
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+        self.settings = QSettings("usbhub-panel", "usbhub-panel")
+        self.migrate_settings()
+        self.hub_list = []
+        self.hub = None
+        self.states = {}
+        self.busy = False
+
+        self.setWindowTitle("USB hub")
+        root = QVBoxLayout(self)
+        root.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
+
+        # The ports: a row (landscape) or a column (portrait).
+        self.row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        root.addLayout(self.row)
+        self.buttons = {}
+
+        self.bottom = bottom = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        bottom.addWidget(self.status, 1)
+
+        self.hub_button = QPushButton("Hub")
+        self.hub_menu = QMenu(self.hub_button)
+        self.hub_menu.aboutToShow.connect(self.fill_hub_menu)
+        self.hub_button.setMenu(self.hub_menu)
+        bottom.addWidget(self.hub_button)
+
+        rotate = QPushButton("Rotate")
+        rotate.setToolTip("Switch between a row and a column of ports")
+        rotate.clicked.connect(self.toggle_orientation)
+        bottom.addWidget(rotate)
+        all_on = QPushButton("All on")
+        all_on.clicked.connect(lambda: self.set_all(True))
+        all_off = QPushButton("All off")
+        all_off.clicked.connect(lambda: self.set_all(False))
+        bottom.addWidget(all_on)
+        bottom.addWidget(all_off)
+        root.addLayout(bottom)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.connect_hub()
+        self.timer.start(POLL_MS)
+
+    def migrate_settings(self):
+        # Before uhubctl support, names were stored as names/<port> for the one
+        # Coolgear hub.
+        for key in self.settings.allKeys():
+            m = re.fullmatch(r"names/(\d+)", key)
+            if m:
+                self.settings.setValue(f"names/coolgear/0/{m.group(1)}", self.settings.value(key))
+                self.settings.remove(key)
+
+    # --- hub discovery -------------------------------------------------
+    def connect_hub(self):
+        try:
+            self.hub_list = self.backend.hubs()
+        except BackendError as e:
+            self.show_error(str(e))
+            return
+        if not self.hub_list:
+            self.show_error(f"No hub found ({self.backend.title})")
+            return
+        wanted = self.settings.value(f"hub/{self.backend.name}", "", type=str)
+        hub = next((h for h in self.hub_list if h.key == wanted), None)
+        if hub is None:
+            # First run: skip root hubs (the computer's own ports) if there's anything else.
+            hub = next((h for h in self.hub_list if "-" in h.key), self.hub_list[0])
+        self.use_hub(hub)
+
+    def use_hub(self, hub):
+        changed = self.hub is None or hub.key != self.hub.key or hub.nports != self.hub.nports
+        self.hub = hub
+        self.settings.setValue(f"hub/{self.backend.name}", hub.key)
+        if changed:
+            self.build_buttons()
+        self.refresh()
+
+    def fill_hub_menu(self):
+        self.hub_menu.clear()
+        if len(self.hub_list) > 1:
+            group = QActionGroup(self.hub_menu)
+            for hub in self.hub_list:
+                act = self.hub_menu.addAction(hub.label, lambda h=hub: self.use_hub(h))
+                act.setCheckable(True)
+                act.setChecked(self.hub is not None and hub.key == self.hub.key)
+                group.addAction(act)
+            self.hub_menu.addSeparator()
+        if self.backend.can_save_defaults:
+            self.hub_menu.addAction("Save current states as power-on default…", self.save_defaults)
+        if self.backend.can_reset:
+            self.hub_menu.addAction("Reset hub…", self.reset_hub)
+        self.hub_menu.addAction("Find hubs again", self.rescan)
+
+    def rescan(self):
+        self.hub = None
+        self.connect_hub()
+
+    def build_buttons(self):
+        while self.row.count():
+            item = self.row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.buttons = {}
+        ports = range(1, self.hub.nports + 1)
+        if self.backend.descending:
+            ports = reversed(ports)
+        for port in ports:
+            btn = PortButton(self, port)
+            self.buttons[port] = btn
+            self.row.addWidget(btn)
+        self.apply_orientation()
+
+    # --- layout ---------------------------------------------------------
+    def portrait(self):
+        return self.settings.value("layout/portrait", False, type=bool)
+
+    def apply_orientation(self):
+        if self.portrait():
+            # Lowest port at the top. Coolgear's buttons are added highest first, so they
+            # need bottom-to-top to come out that way.
+            self.row.setDirection(
+                QBoxLayout.Direction.BottomToTop if self.backend.descending
+                else QBoxLayout.Direction.TopToBottom
+            )
+            self.bottom.setDirection(QBoxLayout.Direction.TopToBottom)
+        else:
+            self.row.setDirection(QBoxLayout.Direction.LeftToRight)
+            self.bottom.setDirection(QBoxLayout.Direction.LeftToRight)
+        QTimer.singleShot(0, self.adjustSize)
+
+    def toggle_orientation(self):
+        self.settings.setValue("layout/portrait", not self.portrait())
+        self.apply_orientation()
+
+    # --- state ----------------------------------------------------------
+    def name_key(self, port):
+        return f"names/{self.backend.name}/{self.hub.key}/{port}"
+
+    def name(self, port):
+        return self.settings.value(self.name_key(port), "", type=str)
+
+    def refresh(self):
+        if self.busy:
+            return
+        if not self.hub:
+            self.connect_hub()
+            return
+        try:
+            self.states = self.backend.states(self.hub)
+        except BackendError as e:
+            self.show_error(str(e))
+            self.hub = None     # rediscover next tick (hub unplugged?)
+            return
+        for port, btn in self.buttons.items():
+            btn.setEnabled(True)
+            btn.update_view(self.states.get(port, False), self.name(port))
+        where = self.hub.address if self.backend.name == "coolgear" else f"hub {self.hub.address}"
+        self.status.setText(f"{self.backend.title} · {where} · {self.hub.nports} ports")
+
+    def show_error(self, msg):
+        self.status.setText(f"⚠ {msg}")
+        for btn in self.buttons.values():
+            btn.setEnabled(False)
+
+    # --- actions ----------------------------------------------------------
+    def apply(self, ports, on):
+        if not self.hub:
+            return False
+        self.busy = True
+        try:
+            self.backend.set_ports(self.hub, ports, on)
+            return True
+        except BackendError as e:
+            QMessageBox.warning(self, "USB hub", f"{self.backend.title} failed: {e}")
+            return False
+        finally:
+            self.busy = False
+            self.refresh()
+
+    def set_port(self, port, on):
+        self.apply([port], on)
+
+    def set_all(self, on):
+        if not self.hub:
+            return
+        if not on and QMessageBox.question(
+            self, "USB hub",
+            "Turn every port off?\n\nAnything plugged into this hub loses power, "
+            "your keyboard or mouse included if they're on it."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.apply(list(range(1, self.hub.nports + 1)), on)
+
+    def cycle_port(self, port):
+        if self.apply([port], False):
+            self.busy = True
+            QTimer.singleShot(CYCLE_OFF_MS, lambda: self._cycle_on(port))
+
+    def _cycle_on(self, port):
+        self.busy = False
+        self.apply([port], True)
+
+    def rename_port(self, port):
+        name, ok = QInputDialog.getText(
+            self, "Rename port", f"Name for port {port}:", text=self.name(port)
+        )
+        if ok:
+            self.settings.setValue(self.name_key(port), name.strip())
+            self.refresh()
+
+    def save_defaults(self):
+        if not self.hub:
+            return
+        on = [str(p) for p in sorted(self.states) if self.states[p]]
+        off = [str(p) for p in sorted(self.states) if not self.states[p]]
+        text = (
+            "Save the current port states in the hub as its power-on default?\n\n"
+            f"On: {', '.join(on) or 'none'}\nOff: {', '.join(off) or 'none'}\n\n"
+            "The hub starts this way after a power cut or a reset."
+        )
+        if QMessageBox.question(self, "USB hub", text) != QMessageBox.StandardButton.Yes:
+            return
+        if self.hub_command(self.backend.save_defaults):
+            self.status.setText("Saved as the power-on default")
+
+    def reset_hub(self):
+        if not self.hub:
+            return
+        text = (
+            "Reset the hub?\n\n"
+            "Every device on it disconnects and reconnects, and the ports go back to "
+            "the saved power-on default."
+        )
+        if QMessageBox.question(self, "USB hub", text) != QMessageBox.StandardButton.Yes:
+            return
+        if self.hub_command(self.backend.reset):
+            # The hub drops off USB for a moment (its control port with it); find it
+            # again once it's back rather than flagging an error in between.
+            self.hub = None
+            self.busy = True
+            self.status.setText("Resetting…")
+            QTimer.singleShot(5000, self._after_reset)
+
+    def _after_reset(self):
+        self.busy = False
+        self.connect_hub()
+
+    def hub_command(self, command):
+        self.busy = True
+        try:
+            command(self.hub)
+            return True
+        except BackendError as e:
+            QMessageBox.warning(self, "USB hub", f"{self.backend.title} failed: {e}")
+            return False
+        finally:
+            self.busy = False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Switch USB hub ports on and off.")
+    parser.add_argument("--backend", choices=["auto", *BACKENDS], default="auto",
+                        help="coolgear (cusbi) or uhubctl; default: Coolgear if it finds a hub")
+    args, qt_args = parser.parse_known_args()
+
+    app = QApplication([sys.argv[0], *qt_args])
+    app.setApplicationName("usbhub-panel")
+    app.setDesktopFileName("usbhub-panel")
+    panel = Panel(pick_backend(args.backend))
+    panel.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

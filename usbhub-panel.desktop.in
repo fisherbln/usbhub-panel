@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=USB Hub
+GenericName=USB hub port control
+Comment=Switch USB hub ports on and off (Coolgear managed hubs or uhubctl)
+Exec=@BIN@/usbhub-panel
+Icon=drive-removable-media-usb
+Terminal=false
+Categories=Utility;System;
+Keywords=usb;hub;coolgear;cusbi;uhubctl;power;
