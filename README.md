@@ -36,7 +36,8 @@ GUI at all.
 | | Tested on hardware |
 |---|---|
 | `coolgear` backend (CG-10PU3MGD, firmware v01, Debian 13, KDE Plasma 6) | ✅ |
-| `uhubctl` backend | not yet: reports welcome |
+| `uhubctl` backend on the same CG-10PU3MGD | ⚠️ ports report "off" but keep power (see below) |
+| `uhubctl` backend on other hubs | not yet: reports welcome |
 | Password-protected Coolgear hubs | not supported |
 
 Reports from other hubs and desktops are welcome. Please open an issue with the hub model and
@@ -74,6 +75,11 @@ The last line adds "USB Hub" to your application menu. Then install the tool for
 **Check that power really goes off.** Some hubs report per-port switching but only switch the
 data lines, so a port shows "off" while its device keeps power. Test each port with a USB power
 meter before relying on it.
+
+The Coolgear CG-10PU3MGD is one of them. uhubctl sees its three VIA VL817 chips (2109:2817 and
+2109:0817), which advertise per-port switching and report their ports off, but the sockets keep
+5 V: the hub switches power through its own management controller instead. Use the `coolgear`
+backend on Coolgear hubs; it's what the panel picks when `cusbi` finds one.
 
 ## Use
 
